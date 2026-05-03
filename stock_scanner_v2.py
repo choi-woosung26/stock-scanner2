@@ -39,7 +39,7 @@ ma200_exclude_ratio = st.sidebar.slider(
 
 st.sidebar.markdown("💰 **주가 범위 (원)**")
 min_price = st.sidebar.number_input("최소 금액", value=2000, step=500, min_value=0)
-max_price = st.sidebar.number_input("최대 금액", value=100000, step=1000, min_value=0)
+max_price = st.sidebar.number_input("최대 금액", value=30000, step=1000, min_value=0)
 
 # ── KRX 종목 정보 로딩 (FinanceDataReader 없이) ─────────────────
 @st.cache_data(ttl=3600)
