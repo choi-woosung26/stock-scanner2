@@ -1,0 +1,5 @@
+streamlit
+tradingview-screener
+pandas
+FinanceDataReader
+yfinance
