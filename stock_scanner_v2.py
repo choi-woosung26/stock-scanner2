@@ -4,13 +4,10 @@ import pandas as pd
 import yfinance as yf
 import requests
 import io
-from pykrx import stock as krx_stock
-import OpenDartReader
-import datetime
 
 st.set_page_config(page_title="주식 스캐너 v2", page_icon="📈", layout="wide")
 
-st.title("📈 한국 주식 장기 역배열 검색기 v2")
+st.title("📈 한국 주식 종목 검색기 v2")
 st.markdown("""
 **검색 조건**
 - 📅 월봉 현재 캔들(0봉)에서 **MA10(10개월 이평선) 돌파**
@@ -23,26 +20,22 @@ st.markdown("""
 # ── 사이드바 설정 ────────────────────────────────────────────────
 st.sidebar.header("🔍 검색 설정")
 
-dart_api_key = st.sidebar.text_input(
-    "🔑 DART API Key",
-    type="password",
-    help="https://opendart.fss.or.kr 에서 무료 발급. 없으면 재무 데이터가 생략됩니다."
-)
-
 min_vol_m = st.sidebar.number_input(
     "📦 최소 거래량 (하한선)",
-    value=10000, step=10000,
+    value=100000, step=10000,
     help="월봉 평균 거래량 300% 조건에 더해 최소 거래량 하한선"
 )
 
 vol_ratio = st.sidebar.slider(
     "📊 월봉 평균 대비 거래량 배수 이상 (%)",
     min_value=100, max_value=2000, value=300, step=50,
+    help="10봉 평균 거래량의 몇 % 이상인 종목을 검색할지 설정합니다."
 )
 
 ma200_exclude_ratio = st.sidebar.slider(
     "❌ 200일선 대비 현재가 제외 기준 (%)",
     min_value=30, max_value=1000, value=100, step=50,
+    help="현재가가 200일선보다 이 비율 이상 높으면 제외합니다."
 )
 
 st.sidebar.markdown("💰 **주가 범위 (원)**")
@@ -52,6 +45,7 @@ max_price = st.sidebar.number_input("최대 금액", value=30000, step=1000, min
 # ── KRX 종목 정보 로딩 ─────────────────────────────────────────
 @st.cache_data(ttl=3600)
 def load_krx_name_map():
+    """KRX 공식 데이터포털 API로 종목 정보 로딩"""
     try:
         url = "https://kind.krx.co.kr/corpgeneral/corpList.do"
         params = {"method": "download", "searchType": "13"}
@@ -75,9 +69,11 @@ def load_krx_name_map():
         for _, row in df.iterrows():
             code = str(row[code_col]).zfill(6)
             name = str(row[name_col])
+
             if not code.endswith('0'):
                 exclude_set.add(code)
                 continue
+
             exclude_keywords = ['스팩', 'SPAC', '리츠', 'REIT', '인프라', '환기',
                                  '수익증권', 'ETF', 'ETN', 'ELW']
             if any(kw in name.upper() for kw in exclude_keywords):
@@ -116,6 +112,7 @@ def check_monthly_conditions(code_6, vol_ratio_pct, ma200_excl_pct):
     for suffix in ['.KS', '.KQ']:
         ticker = f"{code_6}{suffix}"
         try:
+            # MA30 확보를 위해 40mo로 변경
             df_m = yf.download(ticker, period="40mo", interval="1mo",
                                auto_adjust=True, progress=False)
             if df_m is None or len(df_m) < 11:
@@ -143,8 +140,10 @@ def check_monthly_conditions(code_6, vol_ratio_pct, ma200_excl_pct):
             if curr_ma10 is None or prev_ma10 is None:
                 continue
 
+            # 돌파 조건: 현재 close > MA10 AND 전월 close <= 전월 MA10
             pass_ma10 = (curr_close > curr_ma10) and (prev_close <= prev_ma10)
 
+            # ── 역배열 조건 ──────────────────────────────────────
             curr_ma20 = float(curr['MA20']) if not pd.isna(curr['MA20']) else None
             curr_ma30 = float(curr['MA30']) if not pd.isna(curr['MA30']) else None
 
@@ -153,12 +152,15 @@ def check_monthly_conditions(code_6, vol_ratio_pct, ma200_excl_pct):
             inv_ma20_ma30 = (curr_ma20 is not None and curr_ma30 is not None
                              and curr_ma20 < curr_ma30)
             pass_inverse = inv_ma10_ma20 or inv_ma20_ma30
+            # ────────────────────────────────────────────────────
 
+            # 거래량 조건
             recent_vols = df_m['Volume'].iloc[-11:-1]
             avg_vol_10  = float(recent_vols.mean())
             curr_vol    = float(curr['Volume'])
             pass_vol    = curr_vol >= avg_vol_10 * (vol_ratio_pct / 100)
 
+            # 200일선 제외 조건
             df_d = yf.download(ticker, period="300d", interval="1d",
                                auto_adjust=True, progress=False)
             sma200_ok  = True
@@ -176,80 +178,6 @@ def check_monthly_conditions(code_6, vol_ratio_pct, ma200_excl_pct):
             continue
 
     return False, False, False, False, None, None, None, None
-
-# ── 외국인/기관 매매 (pykrx) ─────────────────────────────────────
-@st.cache_data(ttl=1800)
-def get_investor_data(code_6):
-    """
-    최근 20거래일 외국인·기관 순매수 합계 반환
-    반환: (외국인_순매수합계, 기관_순매수합계)  단위: 주
-    """
-    try:
-        today = datetime.date.today()
-        # 영업일 기준 약 30일 전 (주말·공휴일 여유 포함)
-        from_date = (today - datetime.timedelta(days=45)).strftime("%Y%m%d")
-        to_date   = today.strftime("%Y%m%d")
-
-        df = krx_stock.get_market_trading_volume_by_investor(
-            from_date, to_date, code_6
-        )
-        if df is None or df.empty:
-            return None, None
-
-        # 컬럼명이 한글로 들어옴: '외국인', '기관합계' 등
-        # 순매수 = 매수 - 매도  (pykrx는 순매수 컬럼을 직접 제공)
-        foreign_col = next((c for c in df.columns if '외국인' in c), None)
-        inst_col    = next((c for c in df.columns if '기관' in c), None)
-
-        foreign_net = int(df[foreign_col].sum()) if foreign_col else None
-        inst_net    = int(df[inst_col].sum())    if inst_col    else None
-
-        return foreign_net, inst_net
-
-    except Exception:
-        return None, None
-
-# ── 재무 데이터 (OpenDartReader) ─────────────────────────────────
-@st.cache_data(ttl=86400)
-def get_financial_data(code_6, dart_api_key):
-    """
-    최근 연간 보고서에서 영업이익·부채비율 반환
-    반환: (영업이익_억원, 부채비율_%)
-    """
-    if not dart_api_key:
-        return None, None
-    try:
-        dart = OpenDartReader.OpenDartReader(dart_api_key)
-
-        # 최근 사업연도 재무제표 (연결 우선, 없으면 개별)
-        year = datetime.date.today().year - 1  # 직전 연도 (공시 시차)
-        fs = dart.finstate(code_6, year, reprt_code='11011')  # 11011=사업보고서
-
-        if fs is None or fs.empty:
-            return None, None
-
-        # 영업이익
-        op_row = fs[fs['account_nm'].str.contains('영업이익', na=False)]
-        op_income = None
-        if not op_row.empty:
-            val = op_row.iloc[0]['thstrm_amount']
-            val = str(val).replace(',', '').replace(' ', '')
-            op_income = round(int(val) / 1e8, 1)  # 원 → 억원
-
-        # 부채비율 = 부채총계 / 자본총계 × 100
-        debt_row   = fs[fs['account_nm'].str.contains('부채총계', na=False)]
-        equity_row = fs[fs['account_nm'].str.contains('자본총계', na=False)]
-        debt_ratio = None
-        if not debt_row.empty and not equity_row.empty:
-            debt   = int(str(debt_row.iloc[0]['thstrm_amount']).replace(',', ''))
-            equity = int(str(equity_row.iloc[0]['thstrm_amount']).replace(',', ''))
-            if equity != 0:
-                debt_ratio = round(debt / equity * 100, 1)
-
-        return op_income, debt_ratio
-
-    except Exception:
-        return None, None
 
 # ── 차트 URL ─────────────────────────────────────────────────────
 def get_chart_url(ticker_raw):
@@ -302,37 +230,26 @@ if st.button("🔍 종목 검색 시작", use_container_width=True):
             for i, (_, row) in enumerate(data.iterrows()):
                 code = row['종목코드']
                 name = row['종목명']
-                status_text.text(f"🔄 [{i+1}/{total}] {name}({code}) 검증 중...")
+                status_text.text(f"🔄 [{i+1}/{total}] {name}({code}) 월봉 검증 중...")
                 progress_bar.progress((i + 1) / total)
 
                 pass_ma10, pass_vol, sma200_ok, pass_inverse, ma10_val, avg_vol, curr_vol, sma200_val = \
                     check_monthly_conditions(code, vol_ratio, ma200_exclude_ratio)
 
                 if pass_ma10 and pass_vol and sma200_ok and pass_inverse:
-
-                    # ── 외국인/기관 매매 ──────────────────────────
-                    foreign_net, inst_net = get_investor_data(code)
-
-                    # ── 재무 데이터 ───────────────────────────────
-                    op_income, debt_ratio = get_financial_data(code, dart_api_key)
-
                     results.append({
-                        '종목명':           name,
-                        '종목코드':         code,
-                        '현재가(원)':       row['close'],
-                        '거래량':           row['volume'],
-                        '등락률(%)':        row['change'],
-                        '200일선':          row.get('SMA200', None),
-                        '52주 신고가':      row.get('price_52_week_high', None),
-                        '월봉MA10':         round(ma10_val, 0) if ma10_val else None,
-                        '월봉평균거래량':    int(avg_vol) if avg_vol else None,
-                        '월봉거래량':       int(curr_vol) if curr_vol else None,
-                        '거래량배수(x)':    round(curr_vol / avg_vol, 2) if avg_vol and avg_vol > 0 else None,
-                        '외국인순매수(주)': foreign_net,
-                        '기관순매수(주)':   inst_net,
-                        '영업이익(억)':     op_income,
-                        '부채비율(%)':      debt_ratio,
-                        'name_raw':         row['name'],
+                        '종목명':         name,
+                        '종목코드':       code,
+                        '현재가(원)':     row['close'],
+                        '거래량':         row['volume'],
+                        '등락률(%)':      row['change'],
+                        '200일선':        row.get('SMA200', None),
+                        '52주 신고가':    row.get('price_52_week_high', None),
+                        '월봉MA10':       round(ma10_val, 0) if ma10_val else None,
+                        '월봉평균거래량':  int(avg_vol) if avg_vol else None,
+                        '월봉거래량':     int(curr_vol) if curr_vol else None,
+                        '거래량배수(x)':  round(curr_vol / avg_vol, 2) if avg_vol and avg_vol > 0 else None,
+                        'name_raw':       row['name'],
                     })
 
             progress_bar.empty()
@@ -344,46 +261,28 @@ if st.button("🔍 종목 검색 시작", use_container_width=True):
                 st.success(f"✅ 최종 {len(results)}개 종목 발견!")
                 result_df = pd.DataFrame(results)
 
-                display_cols = [
-                    '종목명', '종목코드', '현재가(원)', '거래량', '등락률(%)',
-                    '200일선', '월봉MA10', '월봉평균거래량', '월봉거래량', '거래량배수(x)',
-                    '52주 신고가',
-                    '외국인순매수(주)', '기관순매수(주)',   # 신규
-                    '영업이익(억)', '부채비율(%)',           # 신규
-                ]
+                display_cols = ['종목명', '종목코드', '현재가(원)', '거래량', '등락률(%)',
+                                '200일선', '월봉MA10', '월봉평균거래량', '월봉거래량',
+                                '거래량배수(x)', '52주 신고가']
                 display_cols = [c for c in display_cols if c in result_df.columns]
                 display = result_df[display_cols].copy()
 
                 fmt = {
-                    '현재가(원)':       '{:,.0f}',
-                    '거래량':           '{:,.0f}',
-                    '등락률(%)':        '{:+.2f}',
-                    '200일선':          '{:,.0f}',
-                    '월봉MA10':         '{:,.0f}',
-                    '월봉평균거래량':    '{:,.0f}',
-                    '월봉거래량':       '{:,.0f}',
-                    '거래량배수(x)':    '{:.2f}x',
-                    '52주 신고가':      '{:,.0f}',
-                    '외국인순매수(주)': '{:+,.0f}',
-                    '기관순매수(주)':   '{:+,.0f}',
-                    '영업이익(억)':     '{:,.1f}',
-                    '부채비율(%)':      '{:.1f}%',
+                    '현재가(원)':     '{:,.0f}',
+                    '거래량':         '{:,.0f}',
+                    '등락률(%)':      '{:+.2f}',
+                    '200일선':        '{:,.0f}',
+                    '월봉MA10':       '{:,.0f}',
+                    '월봉평균거래량':  '{:,.0f}',
+                    '월봉거래량':     '{:,.0f}',
+                    '거래량배수(x)':  '{:.2f}x',
+                    '52주 신고가':    '{:,.0f}',
                 }
-
-                # 외국인/기관 순매수 양수=매수(초록), 음수=매도(빨강) 색상 강조
-                def highlight_investor(val):
-                    if pd.isna(val):
-                        return ''
-                    return 'color: #16a34a' if val > 0 else 'color: #dc2626' if val < 0 else ''
-
-                styled = (
-                    display.style
-                    .format(fmt, na_rep="-")
-                    .applymap(highlight_investor,
-                              subset=[c for c in ['외국인순매수(주)', '기관순매수(주)']
-                                      if c in display.columns])
+                st.dataframe(
+                    display.style.format(fmt, na_rep="-"),
+                    use_container_width=True,
+                    hide_index=True
                 )
-                st.dataframe(styled, use_container_width=True, hide_index=True)
 
                 st.subheader("📊 트레이딩뷰 차트 바로가기")
                 cols_ui = st.columns(5)
@@ -394,4 +293,4 @@ if st.button("🔍 종목 검색 시작", use_container_width=True):
                         st.link_button(f"📈 {label}", url, use_container_width=True)
 
 st.divider()
-st.caption("본 프로그램은 TradingView·KRX·Yahoo Finance·DART 공개 데이터를 활용하며 투자 권유를 목적으로 하지 않습니다.")
+st.caption("본 프로그램은 TradingView·KRX·Yahoo Finance 공개 데이터를 활용하며 투자 권유를 목적으로 하지 않습니다.")
