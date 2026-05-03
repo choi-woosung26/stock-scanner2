@@ -27,13 +27,13 @@ min_vol_m = st.sidebar.number_input(
 
 vol_ratio = st.sidebar.slider(
     "📊 월봉 평균 대비 거래량 배수 (%)",
-    min_value=100, max_value=1000, value=300, step=50,
+    min_value=100, max_value=2000, value=300, step=50,
     help="10봉 평균 거래량의 몇 % 이상인 종목을 검색할지 설정합니다."
 )
 
 ma200_exclude_ratio = st.sidebar.slider(
     "❌ 200일선 대비 현재가 제외 기준 (%)",
-    min_value=200, max_value=1000, value=400, step=50,
+    min_value=30, max_value=1000, value=400, step=50,
     help="현재가가 200일선보다 이 비율 이상 높으면 제외합니다."
 )
 
