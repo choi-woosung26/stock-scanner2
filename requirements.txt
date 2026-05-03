@@ -3,3 +3,4 @@ pandas
 yfinance
 tradingview-screener
 requests
+lxml
