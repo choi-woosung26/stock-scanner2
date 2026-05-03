@@ -4,4 +4,3 @@ yfinance
 tradingview-screener
 requests
 lxml
-pip install pykrx OpenDartReader
