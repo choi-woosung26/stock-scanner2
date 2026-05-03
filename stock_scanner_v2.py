@@ -14,6 +14,7 @@ st.markdown("""
 - 📦 월봉 **10봉 평균 거래량의 300% 이상** 거래량
 - ❌ 일봉 200일선보다 현재가가 **400% 이상 높으면 제외**
 - 🚫 ETF · 스팩 · 우선주 자동 제외
+- 🔄 월봉 **MA10 < MA20** 또는 **MA20 < MA30** 역배열 조건 중 하나 충족
 """)
 
 # ── 사이드바 설정 ────────────────────────────────────────────────
@@ -41,7 +42,7 @@ st.sidebar.markdown("💰 **주가 범위 (원)**")
 min_price = st.sidebar.number_input("최소 금액", value=2000, step=500, min_value=0)
 max_price = st.sidebar.number_input("최대 금액", value=30000, step=1000, min_value=0)
 
-# ── KRX 종목 정보 로딩 (FinanceDataReader 없이) ─────────────────
+# ── KRX 종목 정보 로딩 ─────────────────────────────────────────
 @st.cache_data(ttl=3600)
 def load_krx_name_map():
     """KRX 공식 데이터포털 API로 종목 정보 로딩"""
@@ -111,7 +112,8 @@ def check_monthly_conditions(code_6, vol_ratio_pct, ma200_excl_pct):
     for suffix in ['.KS', '.KQ']:
         ticker = f"{code_6}{suffix}"
         try:
-            df_m = yf.download(ticker, period="15mo", interval="1mo",
+            # MA30 확보를 위해 40mo로 변경
+            df_m = yf.download(ticker, period="40mo", interval="1mo",
                                auto_adjust=True, progress=False)
             if df_m is None or len(df_m) < 11:
                 continue
@@ -124,6 +126,8 @@ def check_monthly_conditions(code_6, vol_ratio_pct, ma200_excl_pct):
                 continue
 
             df_m['MA10'] = df_m['Close'].rolling(10).mean()
+            df_m['MA20'] = df_m['Close'].rolling(20).mean()
+            df_m['MA30'] = df_m['Close'].rolling(30).mean()
 
             curr = df_m.iloc[-1]
             prev = df_m.iloc[-2]
@@ -138,6 +142,17 @@ def check_monthly_conditions(code_6, vol_ratio_pct, ma200_excl_pct):
 
             # 돌파 조건: 현재 close > MA10 AND 전월 close <= 전월 MA10
             pass_ma10 = (curr_close > curr_ma10) and (prev_close <= prev_ma10)
+
+            # ── 역배열 조건 ──────────────────────────────────────
+            curr_ma20 = float(curr['MA20']) if not pd.isna(curr['MA20']) else None
+            curr_ma30 = float(curr['MA30']) if not pd.isna(curr['MA30']) else None
+
+            inv_ma10_ma20 = (curr_ma10 is not None and curr_ma20 is not None
+                             and curr_ma10 < curr_ma20)
+            inv_ma20_ma30 = (curr_ma20 is not None and curr_ma30 is not None
+                             and curr_ma20 < curr_ma30)
+            pass_inverse = inv_ma10_ma20 or inv_ma20_ma30
+            # ────────────────────────────────────────────────────
 
             # 거래량 조건
             recent_vols = df_m['Volume'].iloc[-11:-1]
@@ -157,12 +172,12 @@ def check_monthly_conditions(code_6, vol_ratio_pct, ma200_excl_pct):
                 sma200_val = float(df_d['Close'].rolling(200).mean().iloc[-1])
                 sma200_ok  = curr_close < sma200_val * (1 + ma200_excl_pct / 100)
 
-            return pass_ma10, pass_vol, sma200_ok, curr_ma10, avg_vol_10, curr_vol, sma200_val
+            return pass_ma10, pass_vol, sma200_ok, pass_inverse, curr_ma10, avg_vol_10, curr_vol, sma200_val
 
         except Exception:
             continue
 
-    return False, False, False, None, None, None, None
+    return False, False, False, False, None, None, None, None
 
 # ── 차트 URL ─────────────────────────────────────────────────────
 def get_chart_url(ticker_raw):
@@ -218,10 +233,10 @@ if st.button("🔍 종목 검색 시작", use_container_width=True):
                 status_text.text(f"🔄 [{i+1}/{total}] {name}({code}) 월봉 검증 중...")
                 progress_bar.progress((i + 1) / total)
 
-                pass_ma10, pass_vol, sma200_ok, ma10_val, avg_vol, curr_vol, sma200_val = \
+                pass_ma10, pass_vol, sma200_ok, pass_inverse, ma10_val, avg_vol, curr_vol, sma200_val = \
                     check_monthly_conditions(code, vol_ratio, ma200_exclude_ratio)
 
-                if pass_ma10 and pass_vol and sma200_ok:
+                if pass_ma10 and pass_vol and sma200_ok and pass_inverse:
                     results.append({
                         '종목명':         name,
                         '종목코드':       code,
