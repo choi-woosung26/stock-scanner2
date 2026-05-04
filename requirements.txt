@@ -4,5 +4,4 @@ yfinance
 tradingview-screener
 requests
 lxml
-Chart.js 4.4.1
-st.components.v1.html()
+plotly
