@@ -1,11 +1,11 @@
 import streamlit as st
+import streamlit.components.v1
 from tradingview_screener import Query, col
 import pandas as pd
 import yfinance as yf
 import requests
 import io
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
+import json
 
 st.set_page_config(page_title="주식 스캐너 v3", page_icon="📈", layout="wide")
 
@@ -151,70 +151,252 @@ def get_financial_history(code_6: str):
     return pd.Series(dtype=float), pd.Series(dtype=float)
 
 
-# ── 재무 그래프 렌더링 ────────────────────────────────────────────
+# ── 재무 그래프 렌더링 (Chart.js HTML) ───────────────────────────
 def render_financial_chart(name: str, code: str, op_series: pd.Series, debt_series: pd.Series):
-    """영업이익(억원)과 부채비율(%) 듀얼 축 차트"""
+    """
+    영업이익(억원, 녹색 막대 좌축)과 부채비율(%, 주황색 막대 우축)을
+    분기별로 나란히 표시하는 Chart.js 기반 HTML 차트.
+    - 0선 및 좌우 세로축선: 검은색
+    - 억원 단위 레이블: 좌축 상단, % 단위 레이블: 우축 상단
+    - 음수 영업이익: 빨간색 막대
+    """
     has_op   = not op_series.empty
     has_debt = not debt_series.empty
 
     if not has_op and not has_debt:
-        st.warning(f"**{name}** — 재무 데이터를 가져올 수 없습니다.")
+        st.warning(f"{name} — 재무 데이터를 가져올 수 없습니다.")
         return
 
-    fig = make_subplots(
-        rows=1, cols=1,
-        specs=[[{"secondary_y": True}]],
-    )
+    # 공통 분기 인덱스 구성
+    if has_op and has_debt:
+        all_idx = sorted(set(op_series.index) | set(debt_series.index))
+    elif has_op:
+        all_idx = list(op_series.index)
+    else:
+        all_idx = list(debt_series.index)
 
-    # 영업이익 (막대)
-    if has_op:
-        colors = ['#EF4444' if v < 0 else '#3B82F6' for v in op_series.values]
-        fig.add_trace(
-            go.Bar(
-                x=op_series.index.tolist(),
-                y=op_series.values.tolist(),
-                name="영업이익 (억원)",
-                marker_color=colors,
-                opacity=0.85,
-                text=[f"{v:,.0f}" for v in op_series.values],
-                textposition='outside',
-            ),
-            secondary_y=False,
-        )
+    quarters  = all_idx
+    op_vals   = [round(float(op_series[q]),  1) if (has_op   and q in op_series.index)   else None for q in quarters]
+    debt_vals = [round(float(debt_series[q]),1) if (has_debt and q in debt_series.index) else None for q in quarters]
 
-    # 부채비율 (꺾은선)
-    if has_debt:
-        fig.add_trace(
-            go.Scatter(
-                x=debt_series.index.tolist(),
-                y=debt_series.values.tolist(),
-                name="부채비율 (%)",
-                mode='lines+markers+text',
-                line=dict(color='#F59E0B', width=2.5),
-                marker=dict(size=8),
-                text=[f"{v:.1f}%" for v in debt_series.values],
-                textposition='top center',
-            ),
-            secondary_y=True,
-        )
+    op_colors = []
+    for v in op_vals:
+        if v is None:
+            op_colors.append('#3a9e5f')
+        elif v < 0:
+            op_colors.append('#c0392b')
+        else:
+            op_colors.append('#3a9e5f')
 
-    fig.update_layout(
-        title=dict(text=f"📊 {name} ({code}) — 분기별 재무 추이", font=dict(size=15)),
-        height=380,
-        legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1),
-        plot_bgcolor='rgba(0,0,0,0)',
-        paper_bgcolor='rgba(0,0,0,0)',
-        margin=dict(t=60, b=40, l=50, r=50),
-        hovermode='x unified',
-        bargap=0.35,
-    )
-    fig.update_xaxes(showgrid=False, title_text="분기")
-    fig.update_yaxes(title_text="영업이익 (억원)", secondary_y=False,
-                     showgrid=True, gridcolor='rgba(128,128,128,0.15)')
-    fig.update_yaxes(title_text="부채비율 (%)", secondary_y=True,
-                     showgrid=False)
+    chart_id = f"chart_{code}"
 
-    st.plotly_chart(fig, use_container_width=True, config={'displayModeBar': False})
+    html = f"""
+<div style="background:linear-gradient(160deg,#d4edda 0%,#e8f5e9 40%,#f0faf1 100%);
+            border-radius:12px;padding:24px 28px 20px;font-family:'Malgun Gothic',sans-serif;
+            position:relative;overflow:hidden;">
+  <div style="position:absolute;top:0;left:0;right:0;height:50px;
+              background:linear-gradient(180deg,rgba(255,255,255,0.5) 0%,transparent 100%);
+              border-radius:12px 12px 60% 60%/12px 12px 28px 28px;"></div>
+  <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;position:relative;">
+    <div style="width:13px;height:13px;background:#2d6a3f;border-radius:2px;"></div>
+    <span style="font-size:15px;font-weight:700;color:#1a3a24;">{name} ({code}) — 분기별 재무 추이</span>
+  </div>
+
+  <div style="display:flex;justify-content:space-between;font-size:11px;font-weight:700;
+              margin-bottom:2px;padding:0 4px;position:relative;">
+    <span style="color:#2d7a4a;">억원</span>
+    <span style="color:#b05010;">%</span>
+  </div>
+
+  <div style="position:relative;height:320px;">
+    <canvas id="{chart_id}" role="img"
+      aria-label="{name} 분기별 영업이익과 부채비율 막대 차트">
+      영업이익: {op_vals} / 부채비율: {debt_vals}
+    </canvas>
+  </div>
+
+  <div style="display:flex;justify-content:center;gap:24px;margin-top:12px;font-size:12px;color:#444;">
+    <span style="display:flex;align-items:center;gap:5px;">
+      <span style="width:14px;height:11px;background:#3a9e5f;border-radius:2px;display:inline-block;"></span>
+      영업이익 (억원)
+    </span>
+    <span style="display:flex;align-items:center;gap:5px;">
+      <span style="width:14px;height:11px;background:#e07010;border-radius:2px;display:inline-block;"></span>
+      부채비율 (%)
+    </span>
+  </div>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
+<script>
+(function() {{
+  const quarters  = {json.dumps(quarters)};
+  const opVals    = {json.dumps(op_vals)};
+  const debtVals  = {json.dumps(debt_vals)};
+  const opColors  = {json.dumps(op_colors)};
+
+  const ctx = document.getElementById('{chart_id}');
+  if (!ctx) return;
+
+  new Chart(ctx, {{
+    data: {{
+      labels: quarters,
+      datasets: [
+        {{
+          type: 'bar',
+          label: '영업이익',
+          data: opVals,
+          backgroundColor: opColors,
+          borderRadius: 4,
+          borderSkipped: false,
+          borderWidth: 0,
+          yAxisID: 'yLeft',
+          order: 1,
+        }},
+        {{
+          type: 'bar',
+          label: '부채비율',
+          data: debtVals,
+          backgroundColor: '#e07010',
+          borderRadius: 4,
+          borderSkipped: 'bottom',
+          borderWidth: 0,
+          yAxisID: 'yRight',
+          order: 2,
+        }}
+      ]
+    }},
+    options: {{
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: {{
+        legend: {{ display: false }},
+        tooltip: {{
+          mode: 'index',
+          intersect: false,
+          callbacks: {{
+            label: ctx => ctx.datasetIndex === 0
+              ? '영업이익: ' + (ctx.raw !== null ? ctx.raw.toLocaleString() + '억원' : '-')
+              : '부채비율: ' + (ctx.raw !== null ? ctx.raw.toFixed(1) + '%' : '-')
+          }}
+        }}
+      }},
+      scales: {{
+        x: {{
+          grid: {{ display: false }},
+          ticks: {{
+            color: '#fff',
+            font: {{ size: 11, weight: '600' }},
+            maxRotation: 0,
+            autoSkip: false,
+            padding: 4,
+          }},
+          border: {{ display: false }},
+        }},
+        yLeft: {{
+          type: 'linear',
+          position: 'left',
+          ticks: {{
+            color: '#2d7a4a',
+            font: {{ size: 11 }},
+            callback: v => v.toLocaleString(),
+          }},
+          grid: {{
+            color: ctx => ctx.tick.value === 0 ? '#000000' : 'rgba(180,200,180,0.35)',
+            lineWidth: ctx => ctx.tick.value === 0 ? 2 : 1,
+          }},
+          border: {{ display: false }},
+          title: {{ display: false }},
+        }},
+        yRight: {{
+          type: 'linear',
+          position: 'right',
+          min: 0,
+          ticks: {{
+            color: '#b05010',
+            font: {{ size: 11 }},
+            callback: v => v + '%',
+          }},
+          grid: {{ display: false }},
+          border: {{ display: false }},
+          title: {{ display: false }},
+        }}
+      }},
+      layout: {{ padding: {{ top: 24, bottom: 0 }} }},
+    }},
+    plugins: [{{
+      id: 'customDraw_{code}',
+      afterDatasetsDraw(chart) {{
+        const ctx = chart.ctx;
+        const meta0 = chart.getDatasetMeta(0);
+        const meta1 = chart.getDatasetMeta(1);
+        const yLeft = chart.scales.yLeft;
+
+        ctx.save();
+
+        // 0선 (검은색 굵게)
+        const zeroY = yLeft.getPixelForValue(0);
+        ctx.beginPath();
+        ctx.moveTo(chart.chartArea.left, zeroY);
+        ctx.lineTo(chart.chartArea.right, zeroY);
+        ctx.strokeStyle = '#000000';
+        ctx.lineWidth = 2;
+        ctx.stroke();
+
+        // 좌우 세로축선 (검은색)
+        ctx.beginPath();
+        ctx.moveTo(chart.chartArea.left, chart.chartArea.top);
+        ctx.lineTo(chart.chartArea.left, chart.chartArea.bottom);
+        ctx.strokeStyle = '#000000';
+        ctx.lineWidth = 1.5;
+        ctx.stroke();
+
+        ctx.beginPath();
+        ctx.moveTo(chart.chartArea.right, chart.chartArea.top);
+        ctx.lineTo(chart.chartArea.right, chart.chartArea.bottom);
+        ctx.strokeStyle = '#000000';
+        ctx.lineWidth = 1.5;
+        ctx.stroke();
+
+        // 막대 위 수치 레이블
+        ctx.font = "bold 10px 'Malgun Gothic', sans-serif";
+        ctx.textAlign = 'center';
+
+        opVals.forEach((val, i) => {{
+          if (val === null) return;
+          const el = meta0.data[i];
+          ctx.fillStyle = val < 0 ? '#8a1a10' : '#1a5c30';
+          const y = val < 0 ? el.y + 14 : el.y - 7;
+          ctx.fillText(val.toLocaleString(), el.x, y);
+        }});
+
+        debtVals.forEach((val, i) => {{
+          if (val === null) return;
+          const el = meta1.data[i];
+          ctx.fillStyle = '#8a3d00';
+          ctx.fillText(val.toFixed(1) + '%', el.x, el.y - 7);
+        }});
+
+        // X축 회색 배경 + 기간 텍스트
+        const xScale = chart.scales.x;
+        const yBottom = chart.chartArea.bottom;
+        ctx.fillStyle = '#555555';
+        ctx.fillRect(chart.chartArea.left, yBottom, chart.chartArea.width, 28);
+        ctx.font = "bold 11px 'Malgun Gothic', sans-serif";
+        ctx.fillStyle = '#ffffff';
+        quarters.forEach((q, i) => {{
+          const x = xScale.getPixelForValue(i);
+          ctx.fillText(q, x, yBottom + 19);
+        }});
+
+        ctx.restore();
+      }}
+    }}]
+  }});
+}})();
+</script>
+"""
+    st.components.v1.html(html, height=430, scrolling=False)
 
 
 # ── TradingView 1차 스캔 ─────────────────────────────────────────
@@ -492,4 +674,3 @@ if st.button("🔍 종목 검색 시작", use_container_width=True):
 
 st.divider()
 st.caption("본 프로그램은 TradingView·KRX·Yahoo Finance 공개 데이터를 활용하며 투자 권유를 목적으로 하지 않습니다.")
-
