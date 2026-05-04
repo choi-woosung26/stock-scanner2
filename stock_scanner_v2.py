@@ -24,7 +24,7 @@ st.sidebar.header("🔍 검색 설정")
 
 min_vol_m = st.sidebar.number_input(
     "📦 최소 거래량 (하한선)",
-    value=100000, step=10000,
+    value=50000, step=10000,
     help="월봉 평균 거래량 300% 조건에 더해 최소 거래량 하한선"
 )
 
