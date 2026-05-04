@@ -4,10 +4,12 @@ import pandas as pd
 import yfinance as yf
 import requests
 import io
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 
-st.set_page_config(page_title="주식 스캐너 v2", page_icon="📈", layout="wide")
+st.set_page_config(page_title="주식 스캐너 v3", page_icon="📈", layout="wide")
 
-st.title("📈 한국 주식 종목 검색기 v2")
+st.title("📈 한국 주식 종목 검색기 v3")
 st.markdown("""
 **검색 조건**
 - 📅 월봉 현재 캔들(0봉)에서 **MA10(10개월 이평선) 돌파**
@@ -85,6 +87,136 @@ def load_krx_name_map():
         st.warning(f"KRX 종목 정보 로딩 실패 ({e}). 이름 없이 진행합니다.")
         return {}, set()
 
+
+# ── 재무 데이터 (영업이익 · 부채비율) ─────────────────────────────
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_financial_history(code_6: str):
+    """
+    yfinance로 분기별 영업이익 및 부채비율(총부채/자기자본×100) 조회.
+    최근 6개 분기 데이터를 반환합니다.
+    반환: (op_series, debt_series)  각각 pd.Series (index=분기문자열)
+    """
+    for suffix in ['.KS', '.KQ']:
+        ticker_str = f"{code_6}{suffix}"
+        try:
+            tk = yf.Ticker(ticker_str)
+
+            # ── 영업이익 ──────────────────────────────────────
+            inc = tk.quarterly_income_stmt
+            op_series = pd.Series(dtype=float)
+            if inc is not None and not inc.empty:
+                for label in ['Operating Income', 'EBIT', 'Operating Revenue']:
+                    if label in inc.index:
+                        raw = inc.loc[label].dropna()
+                        if not raw.empty:
+                            raw.index = pd.to_datetime(raw.index)
+                            raw = raw.sort_index()
+                            op_series = raw.tail(6) / 1e8  # 억 원 단위
+                            op_series.index = [d.strftime('%Y.%m') for d in op_series.index]
+                            break
+
+            # ── 부채비율 ──────────────────────────────────────
+            bal = tk.quarterly_balance_sheet
+            debt_series = pd.Series(dtype=float)
+            if bal is not None and not bal.empty:
+                total_liab = None
+                equity = None
+
+                for label in ['Total Liabilities Net Minority Interest', 'Total Liabilities']:
+                    if label in bal.index:
+                        total_liab = bal.loc[label].dropna()
+                        break
+                for label in ['Stockholders Equity', 'Total Equity Gross Minority Interest',
+                               'Common Stock Equity']:
+                    if label in bal.index:
+                        equity = bal.loc[label].dropna()
+                        break
+
+                if total_liab is not None and equity is not None:
+                    total_liab.index = pd.to_datetime(total_liab.index)
+                    equity.index = pd.to_datetime(equity.index)
+                    common_idx = total_liab.index.intersection(equity.index).sort_values()
+                    if len(common_idx) > 0:
+                        ratio = (total_liab[common_idx] / equity[common_idx] * 100).dropna()
+                        ratio = ratio.tail(6)
+                        ratio.index = [d.strftime('%Y.%m') for d in ratio.index]
+                        debt_series = ratio
+
+            if not op_series.empty or not debt_series.empty:
+                return op_series, debt_series
+
+        except Exception:
+            continue
+
+    return pd.Series(dtype=float), pd.Series(dtype=float)
+
+
+# ── 재무 그래프 렌더링 ────────────────────────────────────────────
+def render_financial_chart(name: str, code: str, op_series: pd.Series, debt_series: pd.Series):
+    """영업이익(억원)과 부채비율(%) 듀얼 축 차트"""
+    has_op   = not op_series.empty
+    has_debt = not debt_series.empty
+
+    if not has_op and not has_debt:
+        st.warning(f"**{name}** — 재무 데이터를 가져올 수 없습니다.")
+        return
+
+    fig = make_subplots(
+        rows=1, cols=1,
+        specs=[[{"secondary_y": True}]],
+    )
+
+    # 영업이익 (막대)
+    if has_op:
+        colors = ['#EF4444' if v < 0 else '#3B82F6' for v in op_series.values]
+        fig.add_trace(
+            go.Bar(
+                x=op_series.index.tolist(),
+                y=op_series.values.tolist(),
+                name="영업이익 (억원)",
+                marker_color=colors,
+                opacity=0.85,
+                text=[f"{v:,.0f}" for v in op_series.values],
+                textposition='outside',
+            ),
+            secondary_y=False,
+        )
+
+    # 부채비율 (꺾은선)
+    if has_debt:
+        fig.add_trace(
+            go.Scatter(
+                x=debt_series.index.tolist(),
+                y=debt_series.values.tolist(),
+                name="부채비율 (%)",
+                mode='lines+markers+text',
+                line=dict(color='#F59E0B', width=2.5),
+                marker=dict(size=8),
+                text=[f"{v:.1f}%" for v in debt_series.values],
+                textposition='top center',
+            ),
+            secondary_y=True,
+        )
+
+    fig.update_layout(
+        title=dict(text=f"📊 {name} ({code}) — 분기별 재무 추이", font=dict(size=15)),
+        height=380,
+        legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1),
+        plot_bgcolor='rgba(0,0,0,0)',
+        paper_bgcolor='rgba(0,0,0,0)',
+        margin=dict(t=60, b=40, l=50, r=50),
+        hovermode='x unified',
+        bargap=0.35,
+    )
+    fig.update_xaxes(showgrid=False, title_text="분기")
+    fig.update_yaxes(title_text="영업이익 (억원)", secondary_y=False,
+                     showgrid=True, gridcolor='rgba(128,128,128,0.15)')
+    fig.update_yaxes(title_text="부채비율 (%)", secondary_y=True,
+                     showgrid=False)
+
+    st.plotly_chart(fig, use_container_width=True, config={'displayModeBar': False})
+
+
 # ── TradingView 1차 스캔 ─────────────────────────────────────────
 def run_tv_scanner(min_price, max_price, min_vol_m):
     try:
@@ -107,12 +239,12 @@ def run_tv_scanner(min_price, max_price, min_vol_m):
         st.error(f"TradingView 스캐너 오류: {e}")
         return pd.DataFrame()
 
+
 # ── yfinance 월봉 조건 검증 ──────────────────────────────────────
 def check_monthly_conditions(code_6, vol_ratio_pct, ma200_excl_pct):
     for suffix in ['.KS', '.KQ']:
         ticker = f"{code_6}{suffix}"
         try:
-            # MA30 확보를 위해 40mo로 변경
             df_m = yf.download(ticker, period="40mo", interval="1mo",
                                auto_adjust=True, progress=False)
             if df_m is None or len(df_m) < 11:
@@ -140,10 +272,8 @@ def check_monthly_conditions(code_6, vol_ratio_pct, ma200_excl_pct):
             if curr_ma10 is None or prev_ma10 is None:
                 continue
 
-            # 돌파 조건: 현재 close > MA10 AND 전월 close <= 전월 MA10
             pass_ma10 = (curr_close > curr_ma10) and (prev_close <= prev_ma10)
 
-            # ── 역배열 조건 ──────────────────────────────────────
             curr_ma20 = float(curr['MA20']) if not pd.isna(curr['MA20']) else None
             curr_ma30 = float(curr['MA30']) if not pd.isna(curr['MA30']) else None
 
@@ -152,15 +282,12 @@ def check_monthly_conditions(code_6, vol_ratio_pct, ma200_excl_pct):
             inv_ma20_ma30 = (curr_ma20 is not None and curr_ma30 is not None
                              and curr_ma20 < curr_ma30)
             pass_inverse = inv_ma10_ma20 or inv_ma20_ma30
-            # ────────────────────────────────────────────────────
 
-            # 거래량 조건
             recent_vols = df_m['Volume'].iloc[-11:-1]
             avg_vol_10  = float(recent_vols.mean())
             curr_vol    = float(curr['Volume'])
             pass_vol    = curr_vol >= avg_vol_10 * (vol_ratio_pct / 100)
 
-            # 200일선 제외 조건
             df_d = yf.download(ticker, period="300d", interval="1d",
                                auto_adjust=True, progress=False)
             sma200_ok  = True
@@ -179,10 +306,12 @@ def check_monthly_conditions(code_6, vol_ratio_pct, ma200_excl_pct):
 
     return False, False, False, False, None, None, None, None
 
+
 # ── 차트 URL ─────────────────────────────────────────────────────
 def get_chart_url(ticker_raw):
     symbol = ticker_raw if ":" in str(ticker_raw) else f"KRX:{ticker_raw}"
     return f"https://www.tradingview.com/chart/?symbol={symbol}"
+
 
 # ── 메인 실행 ────────────────────────────────────────────────────
 if st.button("🔍 종목 검색 시작", use_container_width=True):
@@ -261,6 +390,7 @@ if st.button("🔍 종목 검색 시작", use_container_width=True):
                 st.success(f"✅ 최종 {len(results)}개 종목 발견!")
                 result_df = pd.DataFrame(results)
 
+                # ── 결과 테이블 ────────────────────────────────
                 display_cols = ['종목명', '종목코드', '현재가(원)', '거래량', '등락률(%)',
                                 '200일선', '월봉MA10', '월봉평균거래량', '월봉거래량',
                                 '거래량배수(x)', '52주 신고가']
@@ -284,6 +414,7 @@ if st.button("🔍 종목 검색 시작", use_container_width=True):
                     hide_index=True
                 )
 
+                # ── TradingView 바로가기 ───────────────────────
                 st.subheader("📊 트레이딩뷰 차트 바로가기")
                 cols_ui = st.columns(5)
                 for i, row in enumerate(results):
@@ -292,5 +423,73 @@ if st.button("🔍 종목 검색 시작", use_container_width=True):
                     with cols_ui[i % 5]:
                         st.link_button(f"📈 {label}", url, use_container_width=True)
 
+                # ── 재무 그래프 섹션 ──────────────────────────
+                st.divider()
+                st.subheader("📉 종목별 분기 재무 추이 (영업이익 · 부채비율)")
+                st.caption("yfinance 분기별 재무제표 기준 | 영업이익: 억 원 단위 | 부채비율 = 총부채 ÷ 자기자본 × 100")
+
+                # 탭 생성 (최대 20개 탭)
+                tab_labels = [f"{r['종목명']}" for r in results[:20]]
+                tabs = st.tabs(tab_labels)
+
+                for tab, row in zip(tabs, results[:20]):
+                    with tab:
+                        code = row['종목코드']
+                        name = row['종목명']
+
+                        with st.spinner(f"{name} 재무 데이터 조회 중..."):
+                            op_series, debt_series = get_financial_history(code)
+
+                        col1, col2 = st.columns(2)
+
+                        # 최신값 요약 지표
+                        with col1:
+                            if not op_series.empty:
+                                latest_op = op_series.iloc[-1]
+                                delta_op  = op_series.iloc[-1] - op_series.iloc[-2] if len(op_series) >= 2 else None
+                                st.metric(
+                                    "최근 분기 영업이익",
+                                    f"{latest_op:,.0f} 억원",
+                                    delta=f"{delta_op:+,.0f} 억원" if delta_op is not None else None,
+                                    delta_color="normal"
+                                )
+                            else:
+                                st.metric("최근 분기 영업이익", "데이터 없음")
+
+                        with col2:
+                            if not debt_series.empty:
+                                latest_debt = debt_series.iloc[-1]
+                                delta_debt  = debt_series.iloc[-1] - debt_series.iloc[-2] if len(debt_series) >= 2 else None
+                                st.metric(
+                                    "최근 분기 부채비율",
+                                    f"{latest_debt:.1f}%",
+                                    delta=f"{delta_debt:+.1f}%" if delta_debt is not None else None,
+                                    delta_color="inverse"   # 부채비율은 올라가면 나쁨
+                                )
+                            else:
+                                st.metric("최근 분기 부채비율", "데이터 없음")
+
+                        # 듀얼 축 차트
+                        render_financial_chart(name, code, op_series, debt_series)
+
+                        # 데이터 테이블 (토글)
+                        with st.expander("📋 원본 수치 보기"):
+                            fin_df = pd.DataFrame({
+                                '분기':      op_series.index.tolist() if not op_series.empty else debt_series.index.tolist(),
+                                '영업이익(억원)': op_series.values.tolist() if not op_series.empty else [None]*len(debt_series),
+                                '부채비율(%)':   debt_series.reindex(
+                                    op_series.index if not op_series.empty else debt_series.index
+                                ).values.tolist() if not debt_series.empty else [None]*len(op_series),
+                            })
+                            st.dataframe(
+                                fin_df.style.format({
+                                    '영업이익(억원)': lambda v: f"{v:,.0f}" if v is not None else "-",
+                                    '부채비율(%)':   lambda v: f"{v:.1f}%" if v is not None else "-",
+                                }, na_rep="-"),
+                                use_container_width=True,
+                                hide_index=True
+                            )
+
 st.divider()
 st.caption("본 프로그램은 TradingView·KRX·Yahoo Finance 공개 데이터를 활용하며 투자 권유를 목적으로 하지 않습니다.")
+
