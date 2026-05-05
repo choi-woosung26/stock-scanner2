@@ -6,16 +6,18 @@ import yfinance as yf
 import requests
 import io
 import json
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-st.set_page_config(page_title="주식 스캐너 v3", page_icon="📈", layout="wide")
+st.set_page_config(page_title="주식 스캐너 v4", page_icon="📈", layout="wide")
 
-st.title("📈 한국 주식 종목 검색기 v3")
+st.title("📈 한국 주식 종목 검색기 v4")
 st.markdown("""
 **검색 조건**
 - 📅 월봉 현재 캔들(0봉)에서 **MA10(10개월 이평선) 돌파**
 - 📦 월봉 **10봉 평균 거래량의 300% 이상** 거래량
 - ❌ 일봉 200일선보다 현재가가 **400% 이상 높으면 제외**
-- 🚫 ETF · 스팩 · 우선주 자동 제외
+- 🚫 ETF · 스팩 · 우선주 · 거래정지 · 투자경고 · 관리종목 자동 제외
 - 🔄 월봉 **MA10 < MA20** 또는 **MA20 < MA30** 역배열 조건 중 하나 충족
 """)
 
@@ -44,48 +46,121 @@ st.sidebar.markdown("💰 **주가 범위 (원)**")
 min_price = st.sidebar.number_input("최소 금액", value=2000, step=500, min_value=0)
 max_price = st.sidebar.number_input("최대 금액", value=30000, step=1000, min_value=0)
 
-# ── KRX 종목 정보 로딩 ─────────────────────────────────────────
+max_workers = st.sidebar.slider(
+    "⚡ 병렬 처리 수 (workers)",
+    min_value=5, max_value=30, value=15, step=5,
+    help="동시에 검증할 종목 수. 높을수록 빠르지만 네트워크 부하 증가."
+)
+
+# ── KRX 종목 정보 + 제재종목 로딩 ──────────────────────────────────
 @st.cache_data(ttl=3600)
-def load_krx_name_map():
-    """KRX 공식 데이터포털 API로 종목 정보 로딩"""
+def load_krx_data():
+    """
+    KRX 공식 데이터포털 API로 종목 정보 로딩.
+    반환: (name_map, exclude_set, sanction_codes)
+      - name_map      : {코드6자리: 종목명}
+      - exclude_set   : ETF·스팩·우선주 등 제외 코드 집합
+      - sanction_codes: 거래정지·투자경고·관리종목 코드 집합
+    """
+    name_map     = {}
+    exclude_set  = set()
+    sanction_codes = set()
+
+    # ── 1) 기본 종목 목록 (종목명·코드) ──────────────────────────
     try:
         url = "https://kind.krx.co.kr/corpgeneral/corpList.do"
-        params = {"method": "download", "searchType": "13"}
+        params  = {"method": "download", "searchType": "13"}
         headers = {"User-Agent": "Mozilla/5.0"}
         response = requests.get(url, params=params, headers=headers, timeout=10)
         response.encoding = 'euc-kr'
-
         df = pd.read_html(io.StringIO(response.text))[0]
         df.columns = df.columns.str.strip()
 
         code_col = next((c for c in df.columns if '종목코드' in c or '코드' in c), None)
         name_col = next((c for c in df.columns if '회사명' in c or '종목명' in c or '기업명' in c), None)
 
-        if code_col is None or name_col is None:
-            return {}, set()
+        if code_col and name_col:
+            df[code_col] = df[code_col].astype(str).str.zfill(6)
+            name_map = dict(zip(df[code_col], df[name_col]))
 
-        df[code_col] = df[code_col].astype(str).str.zfill(6)
-        name_map = dict(zip(df[code_col], df[name_col]))
+            for _, row in df.iterrows():
+                code = str(row[code_col]).zfill(6)
+                name = str(row[name_col])
 
-        exclude_set = set()
-        for _, row in df.iterrows():
-            code = str(row[code_col]).zfill(6)
-            name = str(row[name_col])
+                # 우선주 제외 (코드 끝자리가 0이 아님)
+                if not code.endswith('0'):
+                    exclude_set.add(code)
+                    continue
 
-            if not code.endswith('0'):
-                exclude_set.add(code)
-                continue
-
-            exclude_keywords = ['스팩', 'SPAC', '리츠', 'REIT', '인프라', '환기',
-                                 '수익증권', 'ETF', 'ETN', 'ELW']
-            if any(kw in name.upper() for kw in exclude_keywords):
-                exclude_set.add(code)
-
-        return name_map, exclude_set
+                exclude_keywords = ['스팩', 'SPAC', '리츠', 'REIT', '인프라', '환기',
+                                     '수익증권', 'ETF', 'ETN', 'ELW']
+                if any(kw in name.upper() for kw in exclude_keywords):
+                    exclude_set.add(code)
 
     except Exception as e:
-        st.warning(f"KRX 종목 정보 로딩 실패 ({e}). 이름 없이 진행합니다.")
-        return {}, set()
+        st.warning(f"KRX 종목 목록 로딩 실패 ({e}). 이름 없이 진행합니다.")
+
+    # ── 2) 투자유의 종목 (거래정지·투자경고·투자위험·관리종목 등) ──
+    #    KRX 이상급등 + 투자유의 종목 목록
+    sanction_urls = [
+        # 관리종목
+        {
+            "url": "https://kind.krx.co.kr/investwarning/managementissue.do",
+            "params": {"method": "searchManagementIssueSub", "marketType": "0"},
+        },
+        # 투자경고
+        {
+            "url": "https://kind.krx.co.kr/investwarning/investwarning.do",
+            "params": {"method": "searchInvestWarningSub", "marketType": "0"},
+        },
+        # 거래정지
+        {
+            "url": "https://kind.krx.co.kr/investwarning/tradesuspend.do",
+            "params": {"method": "searchTradeSuspendSub", "marketType": "0"},
+        },
+        # 불성실공시
+        {
+            "url": "https://kind.krx.co.kr/investwarning/unfaithfuldisclosure.do",
+            "params": {"method": "searchUnfaithfulDisclosureSub", "marketType": "0"},
+        },
+    ]
+
+    headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://kind.krx.co.kr/"}
+
+    for item in sanction_urls:
+        try:
+            resp = requests.get(item["url"], params=item["params"],
+                                headers=headers, timeout=10)
+            resp.encoding = 'euc-kr'
+            tables = pd.read_html(io.StringIO(resp.text))
+            if not tables:
+                continue
+            tbl = tables[0]
+            tbl.columns = tbl.columns.str.strip()
+
+            code_col = next(
+                (c for c in tbl.columns if '종목코드' in c or '단축코드' in c or '코드' in c),
+                None
+            )
+            if code_col is None:
+                # 종목명으로 역매핑 시도
+                name_col2 = next((c for c in tbl.columns if '종목명' in c or '회사명' in c), None)
+                if name_col2:
+                    rev_map = {v: k for k, v in name_map.items()}
+                    for nm in tbl[name_col2].dropna():
+                        cd = rev_map.get(str(nm).strip())
+                        if cd:
+                            sanction_codes.add(cd)
+                continue
+
+            tbl[code_col] = tbl[code_col].astype(str).str.zfill(6)
+            for cd in tbl[code_col]:
+                sanction_codes.add(cd)
+
+        except Exception:
+            continue
+
+    return name_map, exclude_set, sanction_codes
 
 
 # ── 재무 데이터 (영업이익 · 부채비율) ─────────────────────────────
@@ -120,7 +195,7 @@ def get_financial_history(code_6: str):
             debt_series = pd.Series(dtype=float)
             if bal is not None and not bal.empty:
                 total_liab = None
-                equity = None
+                equity     = None
 
                 for label in ['Total Liabilities Net Minority Interest', 'Total Liabilities']:
                     if label in bal.index:
@@ -134,7 +209,7 @@ def get_financial_history(code_6: str):
 
                 if total_liab is not None and equity is not None:
                     total_liab.index = pd.to_datetime(total_liab.index)
-                    equity.index = pd.to_datetime(equity.index)
+                    equity.index     = pd.to_datetime(equity.index)
                     common_idx = total_liab.index.intersection(equity.index).sort_values()
                     if len(common_idx) > 0:
                         ratio = (total_liab[common_idx] / equity[common_idx] * 100).dropna()
@@ -153,13 +228,6 @@ def get_financial_history(code_6: str):
 
 # ── 재무 그래프 렌더링 (Chart.js HTML) ───────────────────────────
 def render_financial_chart(name: str, code: str, op_series: pd.Series, debt_series: pd.Series):
-    """
-    영업이익(억원, 녹색 막대 좌축)과 부채비율(%, 주황색 막대 우축)을
-    분기별로 나란히 표시하는 Chart.js 기반 HTML 차트.
-    - 0선 및 좌우 세로축선: 검은색
-    - 억원 단위 레이블: 좌축 상단, % 단위 레이블: 우축 상단
-    - 음수 영업이익: 빨간색 막대
-    """
     has_op   = not op_series.empty
     has_debt = not debt_series.empty
 
@@ -167,7 +235,6 @@ def render_financial_chart(name: str, code: str, op_series: pd.Series, debt_seri
         st.warning(f"{name} — 재무 데이터를 가져올 수 없습니다.")
         return
 
-    # 공통 분기 인덱스 구성
     if has_op and has_debt:
         all_idx = sorted(set(op_series.index) | set(debt_series.index))
     elif has_op:
@@ -334,7 +401,6 @@ def render_financial_chart(name: str, code: str, op_series: pd.Series, debt_seri
 
         ctx.save();
 
-        // 0선 (검은색 굵게)
         const zeroY = yLeft.getPixelForValue(0);
         ctx.beginPath();
         ctx.moveTo(chart.chartArea.left, zeroY);
@@ -343,7 +409,6 @@ def render_financial_chart(name: str, code: str, op_series: pd.Series, debt_seri
         ctx.lineWidth = 2;
         ctx.stroke();
 
-        // 좌우 세로축선 (검은색)
         ctx.beginPath();
         ctx.moveTo(chart.chartArea.left, chart.chartArea.top);
         ctx.lineTo(chart.chartArea.left, chart.chartArea.bottom);
@@ -358,7 +423,6 @@ def render_financial_chart(name: str, code: str, op_series: pd.Series, debt_seri
         ctx.lineWidth = 1.5;
         ctx.stroke();
 
-        // 막대 위 수치 레이블
         ctx.font = "bold 10px 'Malgun Gothic', sans-serif";
         ctx.textAlign = 'center';
 
@@ -377,7 +441,6 @@ def render_financial_chart(name: str, code: str, op_series: pd.Series, debt_seri
           ctx.fillText(val.toFixed(1) + '%', el.x, el.y - 7);
         }});
 
-        // X축 회색 배경 + 기간 텍스트
         const xScale = chart.scales.x;
         const yBottom = chart.chartArea.bottom;
         ctx.fillStyle = '#555555';
@@ -399,30 +462,58 @@ def render_financial_chart(name: str, code: str, op_series: pd.Series, debt_seri
     st.components.v1.html(html, height=430, scrolling=False)
 
 
-# ── TradingView 1차 스캔 ─────────────────────────────────────────
-def run_tv_scanner(min_price, max_price, min_vol_m):
-    try:
-        count, data = (
-            Query()
-            .set_markets("korea")
-            .select('name', 'close', 'volume', 'change', 'SMA200', 'price_52_week_high')
-            .where(
-                col('type') == 'stock',
-                col('volume') > min_vol_m,
-                col('close') >= min_price,
-                col('close') <= max_price,
-                col('close') > col('SMA200'),
+# ── TradingView 전체 종목 스캔 (페이지네이션) ──────────────────────
+def run_tv_scanner_full():
+    """
+    주가·거래량 조건 없이 한국 전체 주식을 수집.
+    TradingView 최대 1500개 한도를 활용하고,
+    1500개가 채워지면 offset으로 추가 수집을 시도합니다.
+    """
+    all_rows = []
+    offset   = 0
+    batch    = 1500
+
+    while True:
+        try:
+            count, data = (
+                Query()
+                .set_markets("korea")
+                .select('name', 'close', 'volume', 'change', 'SMA200', 'price_52_week_high')
+                .where(
+                    col('type') == 'stock',
+                )
+                .offset(offset)
+                .limit(batch)
+                .get_scanner_data()
             )
-            .limit(500)
-            .get_scanner_data()
-        )
-        return data
-    except Exception as e:
-        st.error(f"TradingView 스캐너 오류: {e}")
+            if data is None or data.empty:
+                break
+            all_rows.append(data)
+            fetched = len(data)
+            if fetched < batch:
+                break          # 마지막 페이지
+            offset += fetched
+            time.sleep(0.5)    # 서버 부하 방지
+        except Exception as e:
+            st.warning(f"TradingView 스캐너 오류 (offset={offset}): {e}")
+            break
+
+    if not all_rows:
         return pd.DataFrame()
+    return pd.concat(all_rows, ignore_index=True)
 
 
-# ── yfinance 월봉 조건 검증 ──────────────────────────────────────
+# ── 주가·거래량 1차 필터 (TradingView 결과에서 즉시 적용) ────────────
+def apply_price_volume_filter(data: pd.DataFrame, min_price, max_price, min_vol_m) -> pd.DataFrame:
+    mask = (
+        (data['close'] >= min_price) &
+        (data['close'] <= max_price) &
+        (data['volume'] > min_vol_m)
+    )
+    return data[mask].copy()
+
+
+# ── yfinance 월봉 조건 검증 (단일 종목) ──────────────────────────
 def check_monthly_conditions(code_6, vol_ratio_pct, ma200_excl_pct):
     for suffix in ['.KS', '.KQ']:
         ticker = f"{code_6}{suffix}"
@@ -489,6 +580,15 @@ def check_monthly_conditions(code_6, vol_ratio_pct, ma200_excl_pct):
     return False, False, False, False, None, None, None, None
 
 
+# ── 병렬 월봉 검증 래퍼 ─────────────────────────────────────────
+def check_one(row_tuple, vol_ratio_pct, ma200_excl_pct):
+    """ThreadPoolExecutor에서 호출되는 단일 종목 검증 함수."""
+    idx, row = row_tuple
+    code = row['종목코드']
+    result = check_monthly_conditions(code, vol_ratio_pct, ma200_excl_pct)
+    return idx, row, result
+
+
 # ── 차트 URL ─────────────────────────────────────────────────────
 def get_chart_url(ticker_raw):
     symbol = ticker_raw if ":" in str(ticker_raw) else f"KRX:{ticker_raw}"
@@ -500,25 +600,39 @@ if st.button("🔍 종목 검색 시작", use_container_width=True):
     if min_price >= max_price:
         st.error("⚠️ 최소 금액이 최대 금액보다 작아야 합니다.")
     else:
-        with st.spinner("📋 KRX 종목 정보 로딩 중..."):
-            name_map, exclude_set = load_krx_name_map()
+        # ── STEP 1: KRX 종목 정보 + 제재종목 로딩 ─────────────────
+        with st.spinner("📋 KRX 종목 정보 및 제재종목 로딩 중..."):
+            name_map, exclude_set, sanction_codes = load_krx_data()
 
-        with st.spinner("🔍 TradingView 1차 후보 추출 중..."):
-            data = run_tv_scanner(min_price, max_price, min_vol_m)
+        all_excluded = exclude_set | sanction_codes
+        st.info(f"🚫 사전 제외 목록: ETF·스팩·우선주 {len(exclude_set)}개 + "
+                f"제재종목(거래정지·경고·관리 등) {len(sanction_codes)}개 = 총 {len(all_excluded)}개")
+
+        # ── STEP 2: TradingView 전체 스캔 ─────────────────────────
+        with st.spinner("🔍 TradingView 전체 종목 수집 중 (최대 1500개+)..."):
+            data = run_tv_scanner_full()
 
         if data is None or data.empty:
-            st.warning("⚠️ TradingView에서 조건에 맞는 종목이 없습니다.")
+            st.warning("⚠️ TradingView에서 종목을 가져오지 못했습니다.")
         else:
+            total_tv = len(data)
+
+            # ── STEP 3: 종목코드 추출 ──────────────────────────────
             data['종목코드'] = (
                 data['name']
                 .apply(lambda x: str(x).split(':')[-1])
                 .str.zfill(6)
             )
 
-            before_etf = len(data)
-            if exclude_set:
-                data = data[~data['종목코드'].isin(exclude_set)]
+            # ── STEP 4: 주가·거래량 필터 (즉시, TV 데이터 기반) ────
+            data = apply_price_volume_filter(data, min_price, max_price, min_vol_m)
+            after_price = len(data)
 
+            # ── STEP 5: 제재종목 + ETF·스팩 제외 ──────────────────
+            data = data[~data['종목코드'].isin(all_excluded)]
+            after_sanction = len(data)
+
+            # ── STEP 6: 종목명 매핑 + ETF 패턴 추가 제거 ──────────
             data['종목명'] = data['종목코드'].map(name_map)
             data['종목명'] = data.apply(
                 lambda r: name_map.get(str(r['name']).split(':')[-1].zfill(6),
@@ -529,50 +643,73 @@ if st.button("🔍 종목 검색 시작", use_container_width=True):
             etf_pattern = r'ETF|ETN|KODEX|TIGER|RISE|ACE|KBSTAR|HANARO|ARIRANG|SOL|KOSEF'
             data = data[data['종목명'].notna()]
             data = data[~data['종목명'].str.contains(etf_pattern, case=False, na=False)]
-
             after_etf = len(data)
-            st.info(f"📋 1차 후보: {before_etf}개 → ETF·스팩 제외 후: {after_etf}개 → 월봉 조건 검증 시작...")
 
+            st.info(
+                f"📊 수집: {total_tv}개 "
+                f"→ 주가·거래량 필터: {after_price}개 "
+                f"→ 제재·ETF 제외: {after_sanction}개 "
+                f"→ ETF패턴 추가제거: {after_etf}개 "
+                f"→ **월봉 조건 검증 시작** (병렬 {max_workers}workers)"
+            )
+
+            # ── STEP 7: 병렬 월봉 검증 ────────────────────────────
             progress_bar = st.progress(0)
             status_text  = st.empty()
-            results = []
-            total = len(data)
+            results      = []
+            total        = len(data)
+            done_count   = 0
 
-            for i, (_, row) in enumerate(data.iterrows()):
-                code = row['종목코드']
-                name = row['종목명']
-                status_text.text(f"🔄 [{i+1}/{total}] {name}({code}) 월봉 검증 중...")
-                progress_bar.progress((i + 1) / total)
+            rows_list = list(data.iterrows())
 
-                pass_ma10, pass_vol, sma200_ok, pass_inverse, ma10_val, avg_vol, curr_vol, sma200_val = \
-                    check_monthly_conditions(code, vol_ratio, ma200_exclude_ratio)
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = {
+                    executor.submit(check_one, row_tuple, vol_ratio, ma200_exclude_ratio): row_tuple
+                    for row_tuple in rows_list
+                }
 
-                if pass_ma10 and pass_vol and sma200_ok and pass_inverse:
-                    results.append({
-                        '종목명':         name,
-                        '종목코드':       code,
-                        '현재가(원)':     row['close'],
-                        '거래량':         row['volume'],
-                        '등락률(%)':      row['change'],
-                        '200일선':        row.get('SMA200', None),
-                        '52주 신고가':    row.get('price_52_week_high', None),
-                        '월봉MA10':       round(ma10_val, 0) if ma10_val else None,
-                        '월봉평균거래량':  int(avg_vol) if avg_vol else None,
-                        '월봉거래량':     int(curr_vol) if curr_vol else None,
-                        '거래량배수(x)':  round(curr_vol / avg_vol, 2) if avg_vol and avg_vol > 0 else None,
-                        'name_raw':       row['name'],
-                    })
+                for future in as_completed(futures):
+                    done_count += 1
+                    progress_bar.progress(done_count / total)
+
+                    try:
+                        idx, row, (pass_ma10, pass_vol, sma200_ok, pass_inverse,
+                                   ma10_val, avg_vol, curr_vol, sma200_val) = future.result()
+                    except Exception:
+                        status_text.text(f"⚡ [{done_count}/{total}] 검증 중...")
+                        continue
+
+                    code = row['종목코드']
+                    name = row['종목명']
+                    status_text.text(f"⚡ [{done_count}/{total}] {name}({code}) 검증 완료")
+
+                    if pass_ma10 and pass_vol and sma200_ok and pass_inverse:
+                        results.append({
+                            '종목명':         name,
+                            '종목코드':       code,
+                            '현재가(원)':     row['close'],
+                            '거래량':         row['volume'],
+                            '등락률(%)':      row['change'],
+                            '200일선':        row.get('SMA200', None),
+                            '52주 신고가':    row.get('price_52_week_high', None),
+                            '월봉MA10':       round(ma10_val, 0) if ma10_val else None,
+                            '월봉평균거래량':  int(avg_vol) if avg_vol else None,
+                            '월봉거래량':     int(curr_vol) if curr_vol else None,
+                            '거래량배수(x)':  round(curr_vol / avg_vol, 2) if avg_vol and avg_vol > 0 else None,
+                            'name_raw':       row['name'],
+                        })
 
             progress_bar.empty()
             status_text.empty()
 
+            # ── STEP 8: 결과 출력 ──────────────────────────────────
             if not results:
                 st.warning("⚠️ 모든 조건을 만족하는 종목이 없습니다. 조건을 완화해 보세요.")
             else:
                 st.success(f"✅ 최종 {len(results)}개 종목 발견!")
                 result_df = pd.DataFrame(results)
 
-                # ── 결과 테이블 ────────────────────────────────
+                # 결과 테이블
                 display_cols = ['종목명', '종목코드', '현재가(원)', '거래량', '등락률(%)',
                                 '200일선', '월봉MA10', '월봉평균거래량', '월봉거래량',
                                 '거래량배수(x)', '52주 신고가']
@@ -596,7 +733,7 @@ if st.button("🔍 종목 검색 시작", use_container_width=True):
                     hide_index=True
                 )
 
-                # ── TradingView 바로가기 ───────────────────────
+                # TradingView 바로가기
                 st.subheader("📊 트레이딩뷰 차트 바로가기")
                 cols_ui = st.columns(5)
                 for i, row in enumerate(results):
@@ -605,12 +742,11 @@ if st.button("🔍 종목 검색 시작", use_container_width=True):
                     with cols_ui[i % 5]:
                         st.link_button(f"📈 {label}", url, use_container_width=True)
 
-                # ── 재무 그래프 섹션 ──────────────────────────
+                # 재무 그래프 섹션
                 st.divider()
                 st.subheader("📉 종목별 분기 재무 추이 (영업이익 · 부채비율)")
                 st.caption("yfinance 분기별 재무제표 기준 | 영업이익: 억 원 단위 | 부채비율 = 총부채 ÷ 자기자본 × 100")
 
-                # 탭 생성 (최대 20개 탭)
                 tab_labels = [f"{r['종목명']}" for r in results[:20]]
                 tabs = st.tabs(tab_labels)
 
@@ -624,7 +760,6 @@ if st.button("🔍 종목 검색 시작", use_container_width=True):
 
                         col1, col2 = st.columns(2)
 
-                        # 최신값 요약 지표
                         with col1:
                             if not op_series.empty:
                                 latest_op = op_series.iloc[-1]
@@ -646,15 +781,13 @@ if st.button("🔍 종목 검색 시작", use_container_width=True):
                                     "최근 분기 부채비율",
                                     f"{latest_debt:.1f}%",
                                     delta=f"{delta_debt:+.1f}%" if delta_debt is not None else None,
-                                    delta_color="inverse"   # 부채비율은 올라가면 나쁨
+                                    delta_color="inverse"
                                 )
                             else:
                                 st.metric("최근 분기 부채비율", "데이터 없음")
 
-                        # 듀얼 축 차트
                         render_financial_chart(name, code, op_series, debt_series)
 
-                        # 데이터 테이블 (토글)
                         with st.expander("📋 원본 수치 보기"):
                             fin_df = pd.DataFrame({
                                 '분기':      op_series.index.tolist() if not op_series.empty else debt_series.index.tolist(),
