@@ -475,7 +475,7 @@ def run_tv_scanner_full():
 
     while True:
         try:
-            count, data = (
+            result = (
                 Query()
                 .set_markets("korea")
                 .select('name', 'close', 'volume', 'change', 'SMA200', 'price_52_week_high')
@@ -486,16 +486,24 @@ def run_tv_scanner_full():
                 .limit(batch)
                 .get_scanner_data()
             )
+            # 결과가 None이거나 언패킹 불가능한 경우 → 마지막 페이지 도달
+            if result is None:
+                break
+            count, data = result
             if data is None or data.empty:
                 break
             all_rows.append(data)
             fetched = len(data)
+            # 가져온 수가 batch보다 적으면 마지막 페이지
             if fetched < batch:
-                break          # 마지막 페이지
+                break
             offset += fetched
             time.sleep(0.5)    # 서버 부하 방지
+        except TypeError:
+            # get_scanner_data()가 None 반환 시 언패킹 오류 → 정상 종료
+            break
         except Exception as e:
-            st.warning(f"TradingView 스캐너 오류 (offset={offset}): {e}")
+            st.warning(f"TradingView 수집 중단 (offset={offset}): {e}")
             break
 
     if not all_rows:
