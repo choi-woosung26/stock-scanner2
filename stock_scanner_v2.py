@@ -11,7 +11,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 st.set_page_config(page_title="주식 스캐너 v4", page_icon="📈", layout="wide")
 
-st.title("📈 한국 주식 종목 검색기 (월봉 단기 이평선 역배열)")
+st.title("한국 주식 종목 검색기 (월봉 단기 이평선 역배열)")
 st.markdown("""
 **검색 조건**
 - 📅 월봉 현재 캔들(0봉)에서 **MA10(10개월 이평선) 돌파**
